@@ -154,7 +154,15 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
 
         weight = tensor.data
         if weight.dim() == 2:
-            tensor.data = shuffle_weight(weight, layout=layout)
+            shuffled = shuffle_weight(weight, layout=layout)
+            # Preserve the parameter's storage/address when possible so CUDA
+            # graphs captured against it remain valid across in-place online
+            # weight updates (no recapture needed). Fall back to reassignment
+            # only if the shuffled layout changes shape/dtype.
+            if shuffled.shape == weight.shape and shuffled.dtype == weight.dtype:
+                weight.copy_(shuffled)
+            else:
+                tensor.data = shuffled
         elif weight.dim() == 3:
             # Split fully on dim0 and shuffle each 2D slice independently.
             for i in range(weight.shape[0]):
