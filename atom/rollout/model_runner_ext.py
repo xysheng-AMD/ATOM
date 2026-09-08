@@ -33,18 +33,91 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
     to the base veRL behavior.
     """
 
+    # Superseded by `Config.true_vocab_size`, which is where the value belongs:
+    # it is a property of the checkpoint, not of the deployment, and upstream
+    # has no reason to carry a name prefixed with a downstream project's. Read
+    # as a fallback so a deployment that still exports it keeps its mask while
+    # it migrates; the field wins when both are set.
     TRUE_VOCAB_SIZE_ENV = "LUMENRL_ATOM_TRUE_VOCAB_SIZE"
 
     def __init__(self, rank: int, config):
-        raw_true_vocab_size = os.environ.get(self.TRUE_VOCAB_SIZE_ENV, "0")
+        self._true_vocab_size = self._resolve_true_vocab_size(config)
+        super().__init__(rank, config)
+        self._check_true_vocab_size(config)
+
+    @classmethod
+    def _resolve_true_vocab_size(cls, config) -> int:
+        """`Config.true_vocab_size`, or the legacy environment variable.
+
+        0 means "this checkpoint's vocabulary is not padded", which is the
+        right answer for almost every model and costs one comparison per step.
+        """
+        configured = getattr(config, "true_vocab_size", 0) or 0
         try:
-            self._true_vocab_size = int(raw_true_vocab_size or 0)
+            configured = int(configured)
         except (TypeError, ValueError):
             raise ValueError(
-                f"Invalid {self.TRUE_VOCAB_SIZE_ENV}={raw_true_vocab_size!r}; "
-                "expected an integer"
+                f"Invalid Config.true_vocab_size={configured!r}; expected an integer"
             ) from None
-        super().__init__(rank, config)
+        if configured < 0:
+            raise ValueError(
+                f"Invalid Config.true_vocab_size={configured}; expected >= 0"
+            )
+
+        raw = os.environ.get(cls.TRUE_VOCAB_SIZE_ENV)
+        if raw is None or raw.strip() == "":
+            return configured
+        try:
+            from_env = int(raw)
+        except (TypeError, ValueError):
+            raise ValueError(
+                f"Invalid {cls.TRUE_VOCAB_SIZE_ENV}={raw!r}; expected an integer"
+            ) from None
+        if from_env < 0:
+            raise ValueError(
+                f"Invalid {cls.TRUE_VOCAB_SIZE_ENV}={from_env}; expected >= 0"
+            )
+
+        if configured:
+            if from_env != configured:
+                logger.warning(
+                    "Both Config.true_vocab_size=%d and %s=%d are set; using the "
+                    "config field. The environment variable is deprecated.",
+                    configured,
+                    cls.TRUE_VOCAB_SIZE_ENV,
+                    from_env,
+                )
+            return configured
+        logger.warning(
+            "%s is deprecated; pass true_vocab_size=%d to the engine instead.",
+            cls.TRUE_VOCAB_SIZE_ENV,
+            from_env,
+        )
+        return from_env
+
+    def _check_true_vocab_size(self, config) -> None:
+        """Refuse a value that would mask nothing, rather than mask nothing.
+
+        The number counts the tokenizer's real tokens, so it cannot exceed the
+        rows the embedding matrix has. Getting it wrong the other way -- one
+        vocabulary's count against another's checkpoint -- silently disables
+        the mask, which is the failure this whole path exists to prevent.
+        """
+        if not self._true_vocab_size:
+            return
+        padded = getattr(getattr(config, "hf_config", None), "vocab_size", 0) or 0
+        if padded and self._true_vocab_size > padded:
+            raise ValueError(
+                f"true_vocab_size={self._true_vocab_size} exceeds the checkpoint's "
+                f"vocab_size={padded}, so it would mask nothing. It counts the "
+                f"tokenizer's real tokens, which cannot be more than the "
+                f"embedding matrix has rows."
+            )
+        logger.info(
+            "Rollout masks the vocabulary tail above %d (checkpoint has %d rows)",
+            self._true_vocab_size,
+            padded,
+        )
 
     # Environment variable whose value is a comma-separated list of physical
     # GPU indices assigned to this DP rank (e.g. "2,3").  When set, each DP
@@ -65,6 +138,16 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
         hidden_states: torch.Tensor,
         needs_independent_noise: bool = False,
     ) -> ScheduledBatchOutput:
+        """Mask the padding tail of the vocabulary before sampling.
+
+        A checkpoint whose embedding matrix is padded up to a friendlier width
+        -- Qwen3 rounds 151665 real tokens up to 151936 -- leaves the tail rows
+        holding whatever the padding was initialised to. On that checkpoint
+        they are copies of an existing embedding rather than zero or -inf, so
+        the sampler reaches them and can return an id the tokenizer cannot
+        decode. Training frameworks mask them on their side; a rollout engine
+        that does not disagrees with the trainer over exactly those positions.
+        """
         if self._true_vocab_size > 0 and logits.shape[-1] > self._true_vocab_size:
             logits[..., self._true_vocab_size :] = float("-inf")
         return super().postprocess(
