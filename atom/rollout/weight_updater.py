@@ -8,6 +8,32 @@ import torch
 
 logger = logging.getLogger("atom")
 
+# The fused buffers a routed-expert weight can land in, and the shard ids that
+# together make up one expert's slice of each. Re-establishing the layout works
+# on a whole slice, so it can only run once every part of that slice has been
+# rewritten -- shuffling a half-rewritten one mixes two layouts.
+_EXPERT_BUFFER_SHARDS = {
+    "w13_weight": frozenset({"w1", "w3"}),
+    "w2_weight": frozenset({"w2"}),
+}
+
+
+def _copy_into_param_data(
+    param_data: torch.Tensor, loaded_weight: torch.Tensor
+) -> None:
+    """What a `weight_loader_process` does: cast, then copy.
+
+    Used when neither the target parameter nor its module supplies one.
+    """
+    if param_data.dtype != loaded_weight.dtype:
+        loaded_weight = loaded_weight.to(param_data.dtype)
+    if (
+        loaded_weight.shape != param_data.shape
+        and loaded_weight.numel() == param_data.numel()
+    ):
+        loaded_weight = loaded_weight.reshape(param_data.shape)
+    param_data.copy_(loaded_weight)
+
 
 class WeightUpdaterMixin:
     """Mixin providing weight update capabilities for ModelRunner.
@@ -122,24 +148,17 @@ class WeightUpdaterMixin:
                     torch.zeros(param.shape, dtype=torch.float32, device=self.device),
                     requires_grad=False,
                 )
+                # The accumulation buffer is a fresh Parameter, so it carries
+                # none of the target's attributes; weight_loader() reads
+                # weight_loader_process off the parameter it is handed. Fall
+                # back to the module's, then to a plain cast-and-copy, rather
+                # than letting the loader raise on a buffer we just made.
                 wlp = getattr(param, "weight_loader_process", None)
                 if wlp is None:
                     wlp = getattr(module, "weight_loader_process", None)
-                if wlp is not None:
-                    buf.weight_loader_process = wlp
-                else:
-
-                    def _weight_loader_process(param_data, loaded_weight):
-                        if param_data.dtype != loaded_weight.dtype:
-                            loaded_weight = loaded_weight.to(param_data.dtype)
-                        if (
-                            loaded_weight.shape != param_data.shape
-                            and loaded_weight.numel() == param_data.numel()
-                        ):
-                            loaded_weight = loaded_weight.reshape(param_data.shape)
-                        param_data.copy_(loaded_weight)
-
-                    buf.weight_loader_process = _weight_loader_process
+                if wlp is None:
+                    wlp = _copy_into_param_data
+                buf.weight_loader_process = wlp
 
                 for sid in expected:
                     shard_t = self._packed_weight_accum[atom_name]["shards"][sid]
@@ -158,6 +177,204 @@ class WeightUpdaterMixin:
         tensor_gpu = tensor.to(device=self.device)
         weight_loader(param, tensor_gpu, shard_id)
         return "updated"
+
+    def _apply_unmatched_weight(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        param_to_module: dict,
+    ) -> str:
+        """A name that is not a parameter of the model as ATOM built it.
+
+        Either one expert of a fused MoE, or one shard of a packed module.
+        """
+        result = self._apply_expert_weight(name, tensor, param_to_module)
+        if result == "skipped":
+            result = self._apply_packed_weight(name, tensor, param_to_module)
+        return result
+
+    def _get_expert_params_mapping(self) -> dict[str, tuple[str, int, str]]:
+        """{ckpt weight fragment: (ATOM param fragment, expert_id, shard_id)}.
+
+        The same mapping the model loader consults, from the same
+        ``model.get_expert_mapping()``. Built once; models with no MoE layer
+        leave it empty and every lookup then short-circuits.
+        """
+        if not hasattr(self, "_cached_expert_mapping"):
+            mapping: dict[str, tuple[str, int, str]] = {}
+            get_expert_mapping = getattr(self.model, "get_expert_mapping", None)
+            if callable(get_expert_mapping):
+                for (
+                    param_name_part,
+                    weight_name_part,
+                    expert_id,
+                    shard_id,
+                ) in get_expert_mapping():
+                    mapping[weight_name_part] = (param_name_part, expert_id, shard_id)
+            self._cached_expert_mapping = mapping
+            # Longest first, so a more specific fragment wins.
+            self._cached_expert_prefixes = sorted(mapping, key=len, reverse=True)
+        return self._cached_expert_mapping
+
+    @property
+    def _pending_expert_relayout(self) -> dict:
+        """``{(module, param_name): {expert_id: {shard_id, ...}}}`` for this sync.
+
+        Accumulates across buckets and is consumed by
+        ``_finalize_expert_weight_sync`` when the last one lands, so an
+        expert whose w1 and w3 arrive in different buckets is still relaid out
+        exactly once.
+        """
+        if not hasattr(self, "_expert_relayout_pending"):
+            self._expert_relayout_pending = {}
+        return self._expert_relayout_pending
+
+    def _apply_expert_weight(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        param_to_module: dict,
+    ) -> str:
+        """Route one routed-expert weight into its FusedMoE buffer.
+
+        A model's experts arrive one tensor per expert and land in the fused
+        w13_weight / w2_weight of the layer's FusedMoE, which is neither the
+        incoming name nor anything packed_modules_mapping describes. Without
+        this the tensor matches nothing and is counted as skipped, at debug
+        level -- the rollout then serves whatever the experts held at load
+        time and nothing says so. On Qwen3-30B-A3B that is 96 tensors per
+        replica per sync, 48 layers x 2.
+
+        Returns 'updated' or 'skipped'. Never 'updated' for a combination
+        this path does not implement: see _check_expert_sync_supported.
+        """
+        mapping = self._get_expert_params_mapping()
+        if not mapping:
+            return "skipped"
+
+        for weight_name_part in self._cached_expert_prefixes:
+            if weight_name_part not in name:
+                continue
+            param_name_part, expert_id, shard_id = mapping[weight_name_part]
+            atom_name = name.replace(weight_name_part, param_name_part)
+            if atom_name not in param_to_module:
+                continue
+            module, param_name, param = param_to_module[atom_name]
+            weight_loader = getattr(module, "weight_loader", None)
+            if weight_loader is None or not callable(weight_loader):
+                continue
+
+            self._check_expert_sync_supported(
+                name, atom_name, param_name, module, param, tensor
+            )
+            weight_loader(
+                param,
+                tensor.to(device=self.device),
+                weight_name=name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+            )
+            # The layout these buffers must end up in is re-established once
+            # per sync -- see _finalize_expert_weight_sync.
+            arrived = self._pending_expert_relayout.setdefault(
+                (module, param_name), {}
+            )
+            arrived.setdefault(expert_id, set()).add(shard_id)
+            return "updated"
+        return "skipped"
+
+    def _check_expert_sync_supported(
+        self,
+        name: str,
+        atom_name: str,
+        param_name: str,
+        module: torch.nn.Module,
+        param: torch.nn.Parameter,
+        tensor: torch.Tensor,
+    ) -> None:
+        """Refuse the combinations this path does not actually implement.
+
+        Loud, and before the write. ``FusedMoE.weight_loader`` copies into
+        whatever buffer it is handed: on a quantized layer it byte-copies or
+        numerically casts, either of which leaves the expert computing
+        something else while the sync reports updated=1. A silent wrong answer
+        in a rollout is worse than a stopped job.
+        """
+        if param_name not in _EXPERT_BUFFER_SHARDS:
+            raise NotImplementedError(
+                f"{self.label}: routed-expert weight sync writes "
+                f"{sorted(_EXPERT_BUFFER_SHARDS)}, not {param_name!r} "
+                f"(resolved from {name!r}). Scales and packed metadata are not "
+                f"synced; send an unquantized MoE checkpoint."
+            )
+        if not (param.dtype.is_floating_point and param.element_size() >= 2):
+            raise NotImplementedError(
+                f"{self.label}: {atom_name} holds experts as {param.dtype}, a "
+                f"quantized storage format. Writing {tensor.dtype} into it needs "
+                f"the weight and its scale recomputed together, which this path "
+                f"does not do -- FusedMoE.weight_loader would byte-copy or "
+                f"numerically cast, leaving the existing scale describing the old "
+                f"weight. Run the rollout with an unquantized MoE, or extend this "
+                f"path with a requantizing loader for the format."
+            )
+        if getattr(module, "expert_map", None) is not None or getattr(
+            module, "num_redundant_experts", 0
+        ):
+            raise NotImplementedError(
+                f"{self.label}: {atom_name} is expert-parallel or carries redundant "
+                f"expert replicas. Incoming ids then address a rank's local slots "
+                f"through expert_map, only some arrive on this rank, and the "
+                f"replicas are filled after loading rather than sent -- none of "
+                f"which this path tracks. Run the rollout MoE with EP off."
+            )
+
+    def _finalize_expert_weight_sync(self) -> None:
+        """Re-establish the expert layout for the slices this sync rewrote.
+
+        FusedMoE holds w13_weight / w2_weight in the permutation its aiter
+        kernel reads. ``weight_loader`` writes plain row-major bytes over it,
+        so a sync has to re-establish that layout exactly as the initial load
+        does -- once, after the last shard.
+
+        Not by re-running ``process_weights_after_loading``. Those hooks are
+        initialisation, not a repeatable transform: they fold scales, hand the
+        module new Parameter objects through ``atom_parameter()`` while a
+        captured CUDA graph and ``_param_to_module`` still point at the old
+        ones, and several are not idempotent at all. ``Fp8MoEMethod``'s
+        per-tensor path collapses ``w13_weight_scale`` from [E, 2] to [E] on
+        its first call, so a second raises IndexError on ``max(dim=1)``; the
+        channel and block paths re-shuffle weights that are already shuffled,
+        which does not undo the first shuffle but produces a third layout.
+
+        What a sync needs is the layout step alone, on only the slices that
+        were rewritten, in place.
+        """
+        pending = self._pending_expert_relayout
+        if not pending:
+            return
+
+        from atom.model_ops.utils import shuffle_expert_slices
+
+        experts = 0
+        for (module, param_name), arrived in pending.items():
+            required = _EXPERT_BUFFER_SHARDS[param_name]
+            for expert_id, shards in sorted(arrived.items()):
+                missing = sorted(required - shards)
+                if missing:
+                    raise RuntimeError(
+                        f"{self.label}: expert {expert_id} of {param_name} was "
+                        f"rewritten without {missing}. Its slice is half new and "
+                        f"half old, and re-establishing the layout over that "
+                        f"would mix two layouts. Send every shard of an expert "
+                        f"in the same weight update."
+                    )
+            shuffle_expert_slices(getattr(module, param_name), sorted(arrived))
+            experts += len(arrived)
+        logger.info(
+            f"{self.label}: expert layout re-established for {experts} expert "
+            f"slices across {len(pending)} fused buffers"
+        )
+        pending.clear()
 
     def _try_shard_weight(
         self,
@@ -363,7 +580,7 @@ class WeightUpdaterMixin:
 
         for name, tensor in named_tensors:
             if name not in param_to_module:
-                result = self._apply_packed_weight(name, tensor, param_to_module)
+                result = self._apply_unmatched_weight(name, tensor, param_to_module)
                 if result == "updated":
                     updated += 1
                 elif result == "accumulated":
@@ -413,6 +630,8 @@ class WeightUpdaterMixin:
                         f"expected {param.shape}, got {tensor.shape}"
                     )
                     skipped += 1
+
+        self._finalize_expert_weight_sync()
 
         if clear_kv_cache:
             self.clear_kv_cache()
@@ -482,7 +701,7 @@ class WeightUpdaterMixin:
                 )
 
                 if name not in param_to_module:
-                    result = self._apply_packed_weight(name, tensor, param_to_module)
+                    result = self._apply_unmatched_weight(name, tensor, param_to_module)
                     if result == "updated":
                         updated += 1
                     elif result == "accumulated":
@@ -534,6 +753,7 @@ class WeightUpdaterMixin:
                         skipped += 1
 
             if is_last:
+                self._finalize_expert_weight_sync()
                 self.clear_kv_cache()
                 if hasattr(self, "_packed_weight_accum"):
                     if self._packed_weight_accum:
@@ -639,7 +859,7 @@ class WeightUpdaterMixin:
                 tensor = src.to(device=self.device)
 
             if name not in param_to_module:
-                result = self._apply_packed_weight(name, tensor, param_to_module)
+                result = self._apply_unmatched_weight(name, tensor, param_to_module)
                 if result == "updated":
                     updated += 1
                 elif result == "accumulated":
@@ -697,6 +917,7 @@ class WeightUpdaterMixin:
             except Exception:
                 pass  # ipc_collect may not be available on all platforms
 
+            self._finalize_expert_weight_sync()
             self.clear_kv_cache()
             if hasattr(self, "_packed_weight_accum"):
                 if self._packed_weight_accum:
