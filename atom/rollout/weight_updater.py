@@ -293,9 +293,7 @@ class WeightUpdaterMixin:
             )
             # The layout these buffers must end up in is re-established once
             # per sync -- see _finalize_expert_weight_sync.
-            arrived = self._pending_expert_relayout.setdefault(
-                (module, param_name), {}
-            )
+            arrived = self._pending_expert_relayout.setdefault((module, param_name), {})
             arrived.setdefault(expert_id, set()).add(shard_id)
             return "updated"
         return "skipped"
@@ -341,13 +339,15 @@ class WeightUpdaterMixin:
 
         gpu = tensor.to(device=self.device)
         # Split w13's gate and up halves along the intermediate dim, the way
-        # the buffer stacks them. w2 arrives whole.
+        # the buffer stacks them. w2 arrives whole. Views, not copies: the
+        # loader's copy handles a strided source, and materialising these
+        # would double the largest tensor in the sync.
         chunks = gpu.chunk(len(shard_ids), dim=1) if len(shard_ids) > 1 else (gpu,)
         arrived = self._pending_expert_relayout.setdefault((module, param_name), {})
         for shard_id, chunk in zip(shard_ids, chunks):
             weight_loader(
                 param,
-                chunk.contiguous(),
+                chunk,
                 # _copy_expert_shard dispatches on the name containing
                 # "weight"; the fused leaf names do not, so hand it the
                 # resolved ATOM name.
@@ -616,9 +616,7 @@ class WeightUpdaterMixin:
         needs_shuffle = weight_is_stored_preshuffled(
             quant_type,
             getattr(module, "params_dtype", param.dtype),
-            needs_preshuffled_weight=getattr(
-                module, "needs_preshuffled_weight", False
-            ),
+            needs_preshuffled_weight=getattr(module, "needs_preshuffled_weight", False),
         )
 
         # And the same rank check. 3D is Qwen3-Next's GDN conv1d, which the
