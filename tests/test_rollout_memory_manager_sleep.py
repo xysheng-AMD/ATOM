@@ -17,6 +17,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from conftest import atom_config_double
 from torch import nn
 
 from atom.rollout import memory_manager
@@ -24,7 +25,6 @@ from atom.rollout.memory_manager import (
     MemoryManagerMixin,
     sleep_keeps_memory_resident,
 )
-from conftest import atom_config_double
 
 
 class _Runner(MemoryManagerMixin):

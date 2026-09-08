@@ -30,8 +30,8 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-from atom.model_engine.model_runner import ModelRunner  # noqa: E402
-from atom.rollout.model_runner_ext import RLHFModelRunner  # noqa: E402
+from atom.model_engine.model_runner import ModelRunner
+from atom.rollout.model_runner_ext import RLHFModelRunner
 
 ENV = RLHFModelRunner.TRUE_VOCAB_SIZE_ENV
 

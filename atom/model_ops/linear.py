@@ -466,8 +466,7 @@ def weight_is_stored_preshuffled(
         return not is_fp4_blockscale or not use_fp4_non_shuffle_triton_gemm()
     if quant_type == QuantType.per_1x128:
         return (
-            bool(envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)
-            or needs_preshuffled_weight
+            bool(envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE) or needs_preshuffled_weight
         )
     return False
 

@@ -18,13 +18,11 @@ import torch
 from torch import nn
 
 if not torch.cuda.is_available():
-    pytest.skip(
-        "aiter's shuffle_weight needs a ROCm device", allow_module_level=True
-    )
+    pytest.skip("aiter's shuffle_weight needs a ROCm device", allow_module_level=True)
 
-from aiter.ops.shuffle import shuffle_weight  # noqa: E402
+from aiter.ops.shuffle import shuffle_weight
 
-from atom.model_ops.utils import (  # noqa: E402
+from atom.model_ops.utils import (
     shuffle_expert_slices,
     shuffle_weights,
 )

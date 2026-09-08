@@ -28,14 +28,14 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-from aiter import QuantType, dtypes  # noqa: E402
+from aiter import QuantType, dtypes
 
-from atom.model_ops import linear as linear_mod  # noqa: E402
-from atom.model_ops.linear import (  # noqa: E402
+from atom.model_ops import linear as linear_mod
+from atom.model_ops.linear import (
     LinearBase,
     weight_is_stored_preshuffled,
 )
-from atom.rollout.weight_updater import WeightUpdaterMixin  # noqa: E402
+from atom.rollout.weight_updater import WeightUpdaterMixin
 
 PRESHUFFLE_ENV = "ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE"
 
@@ -58,9 +58,7 @@ CASES = [
 @pytest.mark.parametrize("env_value,expected", [("1", True), ("0", False)])
 def test_blockscale_follows_the_preshuffle_env_var(monkeypatch, env_value, expected):
     monkeypatch.setenv(PRESHUFFLE_ENV, env_value)
-    assert (
-        weight_is_stored_preshuffled(QuantType.per_1x128, dtypes.fp8) is expected
-    )
+    assert weight_is_stored_preshuffled(QuantType.per_1x128, dtypes.fp8) is expected
 
 
 def test_a_module_can_override_the_env_var_off(monkeypatch):
@@ -97,18 +95,14 @@ def test_per_token_follows_which_gemm_will_read_it(monkeypatch):
     """
     monkeypatch.setenv("ATOM_USE_TRITON_GEMM", "1")
     expected = linear_mod.gemm_a8w8_triton is None
-    assert (
-        weight_is_stored_preshuffled(QuantType.per_Token, dtypes.fp8) is expected
-    )
+    assert weight_is_stored_preshuffled(QuantType.per_Token, dtypes.fp8) is expected
 
     monkeypatch.setenv("ATOM_USE_TRITON_GEMM", "0")
     assert weight_is_stored_preshuffled(QuantType.per_Token, dtypes.fp8) is True
 
 
 def test_per_token_that_is_not_fp8_is_not_shuffled():
-    assert (
-        weight_is_stored_preshuffled(QuantType.per_Token, torch.bfloat16) is False
-    )
+    assert weight_is_stored_preshuffled(QuantType.per_Token, torch.bfloat16) is False
 
 
 def test_unquantized_and_per_tensor_are_not_shuffled():

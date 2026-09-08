@@ -32,13 +32,13 @@ if not torch.cuda.is_available():
         allow_module_level=True,
     )
 
-from aiter import QuantType, dtypes  # noqa: E402
+from aiter import QuantType, dtypes
 
-from atom.model_ops import moe as moe_module  # noqa: E402
-from atom.model_ops.moe import Fp8MoEMethod, FusedMoE  # noqa: E402
-from atom.model_ops.utils import shuffle_weights  # noqa: E402
-from atom.rollout import weight_sync  # noqa: E402
-from atom.rollout.weight_updater import WeightUpdaterMixin  # noqa: E402
+from atom.model_ops import moe as moe_module
+from atom.model_ops.moe import Fp8MoEMethod, FusedMoE
+from atom.model_ops.utils import shuffle_weights
+from atom.rollout import weight_sync
+from atom.rollout.weight_updater import WeightUpdaterMixin
 
 DEVICE = torch.device("cuda")
 NUM_EXPERTS = 4
@@ -291,9 +291,7 @@ def test_a_half_rewritten_expert_is_refused():
     """w1 without w3: the slice is half new and half old in two layouts."""
     moe = _sync_target()
     tensors = [
-        (name, tensor)
-        for name, tensor in _trainer_tensors(10)
-        if "up_proj" not in name
+        (name, tensor) for name, tensor in _trainer_tensors(10) if "up_proj" not in name
     ]
 
     with pytest.raises(RuntimeError, match="without \\['w3'\\]"):
@@ -401,9 +399,7 @@ def test_the_fp8_post_load_hook_cannot_be_run_twice(monkeypatch):
             requires_grad=False,
         ),
         w2_weight=nn.Parameter(
-            torch.zeros(
-                experts, HIDDEN, INTERMEDIATE, dtype=dtypes.fp8, device=DEVICE
-            ),
+            torch.zeros(experts, HIDDEN, INTERMEDIATE, dtype=dtypes.fp8, device=DEVICE),
             requires_grad=False,
         ),
         w13_weight_scale=nn.Parameter(
