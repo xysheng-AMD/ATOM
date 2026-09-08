@@ -169,6 +169,98 @@ class WeightUpdaterMixin:
         weight_loader(param, tensor_gpu, shard_id)
         return "updated"
 
+    def _get_expert_params_mapping(self) -> dict[str, tuple[str, int, str]]:
+        """{ckpt weight fragment: (ATOM param fragment, expert_id, shard_id)}.
+
+        The same mapping the model loader consults, from the same
+        ``model.get_expert_mapping()``. Built once; models with no MoE layer
+        leave it empty and every lookup then short-circuits.
+        """
+        if not hasattr(self, "_cached_expert_mapping"):
+            mapping: dict[str, tuple[str, int, str]] = {}
+            get_expert_mapping = getattr(self.model, "get_expert_mapping", None)
+            if callable(get_expert_mapping):
+                for (
+                    param_name_part,
+                    weight_name_part,
+                    expert_id,
+                    shard_id,
+                ) in get_expert_mapping():
+                    mapping[weight_name_part] = (param_name_part, expert_id, shard_id)
+            self._cached_expert_mapping = mapping
+            # Longest first, so a more specific fragment wins.
+            self._cached_expert_prefixes = sorted(mapping, key=len, reverse=True)
+        return self._cached_expert_mapping
+
+    def _apply_expert_weight(
+        self,
+        name: str,
+        tensor: torch.Tensor,
+        param_to_module: dict,
+    ) -> str:
+        """Route one routed-expert weight into its FusedMoE buffer.
+
+        A model's experts arrive one tensor per expert and land in the fused
+        w13_weight / w2_weight of the layer's FusedMoE, which is neither the
+        incoming name nor anything packed_modules_mapping describes. Without
+        this the tensor matches nothing and is counted as skipped, at debug
+        level -- the rollout then serves whatever the experts held at load time
+        and nothing says so.
+
+        Returns 'updated' or 'skipped'.
+        """
+        mapping = self._get_expert_params_mapping()
+        if not mapping:
+            return "skipped"
+
+        for weight_name_part in self._cached_expert_prefixes:
+            if weight_name_part not in name:
+                continue
+            param_name_part, expert_id, shard_id = mapping[weight_name_part]
+            atom_name = name.replace(weight_name_part, param_name_part)
+            if atom_name not in param_to_module:
+                continue
+            module, _param_name, param = param_to_module[atom_name]
+            weight_loader = getattr(module, "weight_loader", None)
+            if weight_loader is None or not callable(weight_loader):
+                continue
+            weight_loader(
+                param,
+                tensor.to(device=self.device),
+                weight_name=name,
+                shard_id=shard_id,
+                expert_id=expert_id,
+            )
+            # The layout these buffers must end up in is re-established once
+            # per sync, after the last bucket -- see _rerun_moe_post_load.
+            self._moe_modules_to_post_load.add(module)
+            return "updated"
+        return "skipped"
+
+    @property
+    def _moe_modules_to_post_load(self) -> set:
+        if not hasattr(self, "_moe_post_load_pending"):
+            self._moe_post_load_pending = set()
+        return self._moe_post_load_pending
+
+    def _rerun_moe_post_load(self) -> None:
+        """Re-apply the post-load weight transform to every FusedMoE written.
+
+        FusedMoE's process_weights_after_loading ends in an aiter
+        shuffle_weights that permutes w13_weight / w2_weight into the layout its
+        kernel reads, and a weight update writes plain row-major bytes straight
+        over it. Loading re-establishes the layout; a sync has to as well, or
+        the kernel reads the new weights through the old permutation. This is
+        the same hook the FP4 path in models/deepseek_v4.py re-runs after its
+        custom load, for the same reason.
+        """
+        for module in self._moe_modules_to_post_load:
+            quant_method = getattr(module, "quant_method", None)
+            process = getattr(quant_method, "process_weights_after_loading", None)
+            if callable(process):
+                process(module)
+        self._moe_modules_to_post_load.clear()
+
     def _try_shard_weight(
         self,
         param: torch.nn.Parameter,
@@ -378,7 +470,9 @@ class WeightUpdaterMixin:
 
         for name, tensor in named_tensors:
             if name not in param_to_module:
-                result = self._apply_packed_weight(name, tensor, param_to_module)
+                result = self._apply_expert_weight(name, tensor, param_to_module)
+                if result == "skipped":
+                    result = self._apply_packed_weight(name, tensor, param_to_module)
                 if result == "updated":
                     updated += 1
                 elif result == "accumulated":
@@ -428,6 +522,8 @@ class WeightUpdaterMixin:
                         f"expected {param.shape}, got {tensor.shape}"
                     )
                     skipped += 1
+
+        self._rerun_moe_post_load()
 
         if clear_kv_cache:
             self.clear_kv_cache()
@@ -497,7 +593,11 @@ class WeightUpdaterMixin:
                 )
 
                 if name not in param_to_module:
-                    result = self._apply_packed_weight(name, tensor, param_to_module)
+                    result = self._apply_expert_weight(name, tensor, param_to_module)
+                    if result == "skipped":
+                        result = self._apply_packed_weight(
+                            name, tensor, param_to_module
+                        )
                     if result == "updated":
                         updated += 1
                     elif result == "accumulated":
@@ -549,6 +649,7 @@ class WeightUpdaterMixin:
                         skipped += 1
 
             if is_last:
+                self._rerun_moe_post_load()
                 self.clear_kv_cache()
                 if hasattr(self, "_packed_weight_accum"):
                     if self._packed_weight_accum:
@@ -655,7 +756,9 @@ class WeightUpdaterMixin:
                 tensor = src.to(device=self.device)
 
             if name not in param_to_module:
-                result = self._apply_packed_weight(name, tensor, param_to_module)
+                result = self._apply_expert_weight(name, tensor, param_to_module)
+                if result == "skipped":
+                    result = self._apply_packed_weight(name, tensor, param_to_module)
                 if result == "updated":
                     updated += 1
                 elif result == "accumulated":
@@ -713,6 +816,7 @@ class WeightUpdaterMixin:
             except Exception:
                 pass  # ipc_collect may not be available on all platforms
 
+            self._rerun_moe_post_load()
             self.clear_kv_cache()
             if hasattr(self, "_packed_weight_accum"):
                 if self._packed_weight_accum:
