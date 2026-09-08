@@ -9,6 +9,23 @@ import torch
 logger = logging.getLogger("atom")
 
 
+def _copy_into_param_data(
+    param_data: torch.Tensor, loaded_weight: torch.Tensor
+) -> None:
+    """The default a `weight_loader_process` would do: cast, then copy.
+
+    Used when neither the target parameter nor its module supplies one.
+    """
+    if param_data.dtype != loaded_weight.dtype:
+        loaded_weight = loaded_weight.to(param_data.dtype)
+    if (
+        loaded_weight.shape != param_data.shape
+        and loaded_weight.numel() == param_data.numel()
+    ):
+        loaded_weight = loaded_weight.reshape(param_data.shape)
+    param_data.copy_(loaded_weight)
+
+
 class WeightUpdaterMixin:
     """Mixin providing weight update capabilities for ModelRunner.
 
@@ -122,9 +139,17 @@ class WeightUpdaterMixin:
                     torch.zeros(param.shape, dtype=torch.float32, device=self.device),
                     requires_grad=False,
                 )
+                # The accumulation buffer is a fresh Parameter, so it carries
+                # none of the target's attributes; weight_loader() reads
+                # weight_loader_process off the parameter it is handed. Fall
+                # back to the module's, then to a plain cast-and-copy, rather
+                # than letting the loader raise on a buffer we just made.
                 wlp = getattr(param, "weight_loader_process", None)
-                if wlp is not None:
-                    buf.weight_loader_process = wlp
+                if wlp is None:
+                    wlp = getattr(module, "weight_loader_process", None)
+                if wlp is None:
+                    wlp = _copy_into_param_data
+                buf.weight_loader_process = wlp
 
                 for sid in expected:
                     shard_t = self._packed_weight_accum[atom_name]["shards"][sid]
@@ -297,11 +322,18 @@ class WeightUpdaterMixin:
             return
 
         from aiter import QuantType as _QT
+
         from atom.model_ops.utils import shuffle_weights
+        from atom.utils import envs
 
         needs_shuffle = False
         if quant_type.value == _QT.per_1x128.value:
-            needs_shuffle = True
+            # Same gate as LinearBase.process_weights_after_loading(): blockscale
+            # FP8 weights are preshuffled only when the preshuffle GEMM path is
+            # in use. Shuffling unconditionally here leaves a post-sync weight in
+            # a different layout from the one initial online quantization
+            # produced, which is the bug this fixes.
+            needs_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
         elif quant_type.value == _QT.per_1x32.value:
             needs_shuffle = True
         elif quant_type.value == _QT.per_Token.value:
@@ -312,7 +344,9 @@ class WeightUpdaterMixin:
             except ImportError:
                 needs_shuffle = param.element_size() < 2
 
-        if needs_shuffle:
+        # 3D covers the fused MoE expert weights (w13_weight / w2_weight);
+        # shuffle_weights rejects any other rank.
+        if needs_shuffle and param.dim() in (2, 3):
             shuffle_weights(param)
 
     def update_weights(

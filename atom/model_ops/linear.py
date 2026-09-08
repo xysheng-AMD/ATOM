@@ -769,6 +769,12 @@ class LinearBase(nn.Module):
             )
         self.weight = nn.Parameter(q_weight, requires_grad=False)
         self.weight_scale = nn.Parameter(weight_scale, requires_grad=False)
+        # create_weights() hangs weight_loader_process on the parameter objects,
+        # and every weight_loader() in this file calls it off the parameter, not
+        # off self. Rebinding the parameters above drops the attribute, so the
+        # next load raises AttributeError. Re-attach it to the new objects.
+        self.weight.weight_loader_process = self.weight_loader_process
+        self.weight_scale.weight_loader_process = self.weight_loader_process
 
         # Update quant state
         self.quant_type = online_quant_type

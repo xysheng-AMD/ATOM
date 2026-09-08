@@ -154,7 +154,18 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
 
         weight = tensor.data
         if weight.dim() == 2:
-            tensor.data = shuffle_weight(weight, layout=layout)
+            shuffled = shuffle_weight(weight, layout=layout)
+            # Write through the existing storage rather than rebinding .data, so
+            # a CUDA graph captured against this parameter stays valid when an
+            # online weight update reshuffles it in place. The 3D branch below
+            # already does it this way; this is 2D catching up.
+            if shuffled.shape == weight.shape and shuffled.dtype == weight.dtype:
+                weight.copy_(shuffled)
+            else:
+                # Not reachable through aiter's current shuffle_weight, which
+                # returns a fresh contiguous tensor of the same shape and dtype.
+                # Kept for the day a layout does change one of the two.
+                tensor.data = shuffled
         elif weight.dim() == 3:
             # Split fully on dim0 and shuffle each 2D slice independently.
             for i in range(weight.shape[0]):
