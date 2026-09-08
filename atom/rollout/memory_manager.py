@@ -24,13 +24,38 @@ _POOL_VIEW_ATTRS = (
 )
 
 
+def sleep_keeps_memory_resident(runner) -> bool:
+    """Whether sleep should leave *runner*'s weights and KV pool allocated.
+
+    Decode graphs capture the address of every weight and the base of the KV
+    pool, so releasing either invalidates them and wake has to recapture --
+    which faults under PYTORCH_CUDA_ALLOC_CONF=expandable_segments. Keeping
+    them costs the whole footprint the caller went to sleep to reclaim, so it
+    is opt-in (`Config.sleep_keeps_memory_resident`) rather than the default
+    for every non-eager deployment.
+
+    Both reads go through `getattr`, and `enforce_eager` defaults to True,
+    i.e. to releasing: a host that defines neither gets the behaviour every
+    caller had before this option existed. A function rather than a method
+    because the mixin's methods are called unbound on stand-ins that provide
+    only the attributes they touch -- `tests/test_rollout_memory_manager.py`
+    hands `_release_kv_cache` a `SimpleNamespace`.
+    """
+    if getattr(runner, "enforce_eager", True):
+        return False
+    return bool(
+        getattr(getattr(runner, "config", None), "sleep_keeps_memory_resident", False)
+    )
+
+
 class MemoryManagerMixin:
     """Mixin providing GPU memory lifecycle management for ModelRunner.
 
     Host class must provide:
       - self.model (nn.Module)
       - self.device (torch.device)
-      - self.config (Config) — with num_kvcache_blocks
+      - self.config (Config) — with num_kvcache_blocks and
+        sleep_keeps_memory_resident
       - self.kv_cache — KV cache tensor
       - self.enforce_eager (bool)
       - self.label (str)
@@ -100,9 +125,15 @@ class MemoryManagerMixin:
     def _release_weights(self) -> None:
         if not hasattr(self, "model") or self.model is None:
             return
+        if sleep_keeps_memory_resident(self):
+            logger.info(
+                f"{self.label}: sleep keeps the weights and the CUDA graphs "
+                f"resident (Config.sleep_keeps_memory_resident)"
+            )
+            return
         # Release CUDA graphs first — they hold references to weight memory
         # and prevent freeing GPU memory.
-        if not self.enforce_eager and hasattr(self, "graphs") and self.graphs:
+        if not getattr(self, "enforce_eager", True) and getattr(self, "graphs", None):
             self._graphs_backup_keys = list(self.graphs.keys())
             self.graphs.clear()
             self.graph_pool = None
@@ -122,6 +153,12 @@ class MemoryManagerMixin:
 
     def _resume_weights(self) -> None:
         if not hasattr(self, "model") or self.model is None:
+            return
+        if sleep_keeps_memory_resident(self) and not getattr(
+            self, "_weights_discarded", False
+        ):
+            # Nothing was released, so there is nothing to restore -- and the
+            # point of the option is that no parameter moves.
             return
         if getattr(self, "_weights_discarded", False):
             # Weights were discarded — allocate empty GPU tensors with the
@@ -143,6 +180,13 @@ class MemoryManagerMixin:
 
     def _release_kv_cache(self) -> None:
         if not hasattr(self, "kv_cache") or self.kv_cache is None:
+            return
+        if sleep_keeps_memory_resident(self):
+            logger.info(
+                f"{self.label}: sleep keeps the KV pool resident "
+                f"(Config.sleep_keeps_memory_resident); clear_kv_cache() still "
+                f"zeroes it"
+            )
             return
         self._kv_cache_num_blocks = self.config.num_kvcache_blocks
 
@@ -197,6 +241,14 @@ class MemoryManagerMixin:
         return models
 
     def _resume_kv_cache(self) -> None:
+        # The matching half of the release guard: the pool was never freed, so
+        # there is nothing to re-allocate and rebind.
+        if (
+            sleep_keeps_memory_resident(self)
+            and getattr(self, "kv_cache", None) is not None
+        ):
+            return
+
         if (
             not hasattr(self, "_kv_cache_num_blocks")
             or self._kv_cache_num_blocks is None
@@ -228,8 +280,12 @@ class MemoryManagerMixin:
 
         We only recapture when **both** weights and KV cache are on GPU
         (i.e., the model is fully ready for inference).
+
+        Nothing to do under `sleep_keeps_memory_resident`: the graphs were
+        never released, so `_graphs_backup_keys` is absent and this returns
+        below without touching them.
         """
-        if self.enforce_eager:
+        if getattr(self, "enforce_eager", True):
             return
         if not hasattr(self, "_graphs_backup_keys") or not self._graphs_backup_keys:
             return
