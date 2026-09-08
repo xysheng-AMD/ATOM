@@ -41,6 +41,41 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
     # runner.
     DP_DEVICE_MAP_ENV = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 
+    def postprocess(
+        self,
+        batch: ScheduledBatch,
+        logits: torch.Tensor,
+        temperatures: torch.Tensor,
+        top_ks: torch.Tensor | None,
+        top_ps: torch.Tensor | None,
+        all_greedy: bool,
+        hidden_states: torch.Tensor,
+        needs_independent_noise: bool = False,
+    ) -> ScheduledBatchOutput:
+        """Mask the padding tail of the vocabulary before sampling.
+
+        Set ``Config.true_vocab_size`` when the checkpoint's embedding matrix is
+        wider than the tokenizer. Those extra rows are not zero and not -inf, so
+        sampling reaches them and returns ids that cannot be decoded. Training
+        frameworks mask them on their own side; a rollout engine that does not
+        drifts from the trainer for a reason nothing reports.
+
+        Left at 0, this costs one integer comparison per step.
+        """
+        true_vocab_size = getattr(self.config, "true_vocab_size", 0)
+        if true_vocab_size > 0 and logits.shape[-1] > true_vocab_size:
+            logits[..., true_vocab_size:] = float("-inf")
+        return super().postprocess(
+            batch,
+            logits,
+            temperatures,
+            top_ks,
+            top_ps,
+            all_greedy,
+            hidden_states,
+            needs_independent_noise=needs_independent_noise,
+        )
+
     def _setup_device_and_distributed(self, rank: int, config):
         """Override to set up DP-isolated NCCL worlds.
 

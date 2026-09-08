@@ -1578,6 +1578,13 @@ class Config:
     pipeline_parallel_size: int = 1
     prefill_context_parallel_size: int = 1
     enforce_eager: bool = False
+    # Number of vocabulary positions that carry a real token. A checkpoint whose
+    # embedding matrix is padded up to a friendlier width -- Qwen3 rounds 151665
+    # up to 151936 -- leaves the tail rows holding whatever the padding was
+    # initialised to, which is not -inf and not zero, so sampling can land on an
+    # id the tokenizer cannot decode. 0 means "no padding to mask", which is the
+    # right answer for every model whose vocab is not padded.
+    true_vocab_size: int = 0
     hf_config: PretrainedConfig = field(init=False)
     generation_config: GenerationConfig = field(init=False)
     parallel_config: ParallelConfig = field(default_factory=ParallelConfig)
