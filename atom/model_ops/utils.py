@@ -3,6 +3,7 @@
 
 import importlib.util
 import logging
+from collections.abc import Iterable
 from functools import cache
 from typing import List, Optional, Tuple, Union
 
@@ -155,13 +156,13 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
         weight = tensor.data
         if weight.dim() == 2:
             shuffled = shuffle_weight(weight, layout=layout)
-            # Preserve the parameter's storage/address when possible so CUDA
-            # graphs captured against it remain valid across in-place online
-            # weight updates (no recapture needed). Fall back to reassignment
-            # only if the shuffled layout changes shape/dtype.
+            # Write through the existing storage, the way the 3D branch below
+            # already does, so that an online weight update does not move an
+            # address a captured CUDA graph holds. Rebind only when shuffling
+            # changes the shape or dtype, which no captured graph can survive
+            # anyway.
             if shuffled.shape == weight.shape and shuffled.dtype == weight.dtype:
                 weight.copy_(shuffled)
-                tensor.data = weight
             else:
                 tensor.data = shuffled
         elif weight.dim() == 3:
@@ -179,7 +180,7 @@ def shuffle_weights(*tensors: torch.nn.Parameter, layout: tuple[int, int] = (16,
 
 def shuffle_expert_slices(
     tensor: torch.nn.Parameter,
-    expert_ids,
+    expert_ids: Iterable[int],
     layout: tuple[int, int] = (16, 16),
 ) -> None:
     """Re-apply the expert layout to selected slices of a 3D expert buffer.

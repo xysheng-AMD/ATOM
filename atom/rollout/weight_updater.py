@@ -31,23 +31,6 @@ _FUSED_EXPERT_LEAVES = {
 _EXPERTS_PREFIX_SUFFIX = ".experts"
 
 
-def _copy_into_param_data(
-    param_data: torch.Tensor, loaded_weight: torch.Tensor
-) -> None:
-    """What a `weight_loader_process` does: cast, then copy.
-
-    Used when neither the target parameter nor its module supplies one.
-    """
-    if param_data.dtype != loaded_weight.dtype:
-        loaded_weight = loaded_weight.to(param_data.dtype)
-    if (
-        loaded_weight.shape != param_data.shape
-        and loaded_weight.numel() == param_data.numel()
-    ):
-        loaded_weight = loaded_weight.reshape(param_data.shape)
-    param_data.copy_(loaded_weight)
-
-
 class WeightUpdaterMixin:
     """Mixin providing weight update capabilities for ModelRunner.
 
@@ -162,16 +145,11 @@ class WeightUpdaterMixin:
                     requires_grad=False,
                 )
                 # The accumulation buffer is a fresh Parameter, so it carries
-                # none of the target's attributes; weight_loader() reads
-                # weight_loader_process off the parameter it is handed. Fall
-                # back to the module's, then to a plain cast-and-copy, rather
-                # than letting the loader raise on a buffer we just made.
+                # none of the target's attributes, and weight_loader() reads
+                # weight_loader_process off the parameter it is handed.
                 wlp = getattr(param, "weight_loader_process", None)
-                if wlp is None:
-                    wlp = getattr(module, "weight_loader_process", None)
-                if wlp is None:
-                    wlp = _copy_into_param_data
-                buf.weight_loader_process = wlp
+                if wlp is not None:
+                    buf.weight_loader_process = wlp
 
                 for sid in expected:
                     shard_t = self._packed_weight_accum[atom_name]["shards"][sid]
@@ -206,27 +184,24 @@ class WeightUpdaterMixin:
             result = self._apply_packed_weight(name, tensor, param_to_module)
         return result
 
-    def _get_expert_params_mapping(self) -> dict[str, tuple[str, int, str]]:
-        """{ckpt weight fragment: (ATOM param fragment, expert_id, shard_id)}.
+    def _get_expert_params_mapping(self) -> list[tuple[str, str, int, str]]:
+        """[(ckpt weight fragment, ATOM param fragment, expert_id, shard_id)].
 
         The same mapping the model loader consults, from the same
-        ``model.get_expert_mapping()``. Built once; models with no MoE layer
-        leave it empty and every lookup then short-circuits.
+        ``model.get_expert_mapping()``, ordered longest fragment first so a
+        more specific one wins. Built once; models with no MoE layer leave it
+        empty and every lookup then short-circuits.
         """
         if not hasattr(self, "_cached_expert_mapping"):
-            mapping: dict[str, tuple[str, int, str]] = {}
             get_expert_mapping = getattr(self.model, "get_expert_mapping", None)
-            if callable(get_expert_mapping):
-                for (
-                    param_name_part,
-                    weight_name_part,
-                    expert_id,
-                    shard_id,
-                ) in get_expert_mapping():
-                    mapping[weight_name_part] = (param_name_part, expert_id, shard_id)
-            self._cached_expert_mapping = mapping
-            # Longest first, so a more specific fragment wins.
-            self._cached_expert_prefixes = sorted(mapping, key=len, reverse=True)
+            entries = [
+                (weight_name_part, param_name_part, expert_id, shard_id)
+                for param_name_part, weight_name_part, expert_id, shard_id in (
+                    get_expert_mapping() if callable(get_expert_mapping) else ()
+                )
+            ]
+            entries.sort(key=lambda entry: len(entry[0]), reverse=True)
+            self._cached_expert_mapping = entries
         return self._cached_expert_mapping
 
     @property
@@ -265,20 +240,20 @@ class WeightUpdaterMixin:
         if fused != "skipped":
             return fused
 
-        mapping = self._get_expert_params_mapping()
-        if not mapping:
-            return "skipped"
-
-        for weight_name_part in self._cached_expert_prefixes:
+        for (
+            weight_name_part,
+            param_name_part,
+            expert_id,
+            shard_id,
+        ) in self._get_expert_params_mapping():
             if weight_name_part not in name:
                 continue
-            param_name_part, expert_id, shard_id = mapping[weight_name_part]
             atom_name = name.replace(weight_name_part, param_name_part)
             if atom_name not in param_to_module:
                 continue
             module, param_name, param = param_to_module[atom_name]
             weight_loader = getattr(module, "weight_loader", None)
-            if weight_loader is None or not callable(weight_loader):
+            if not callable(weight_loader):
                 continue
 
             self._check_expert_sync_supported(
@@ -324,7 +299,7 @@ class WeightUpdaterMixin:
             return "skipped"
         module, param_name, param = param_to_module[atom_name]
         weight_loader = getattr(module, "weight_loader", None)
-        if weight_loader is None or not callable(weight_loader):
+        if not callable(weight_loader):
             return "skipped"
 
         self._check_expert_sync_supported(
@@ -342,9 +317,7 @@ class WeightUpdaterMixin:
         # the buffer stacks them. w2 arrives whole. Views, not copies: the
         # loader's copy handles a strided source, and materialising these
         # would double the largest tensor in the sync.
-        chunks = gpu.chunk(len(shard_ids), dim=1) if len(shard_ids) > 1 else (gpu,)
-        arrived = self._pending_expert_relayout.setdefault((module, param_name), {})
-        for shard_id, chunk in zip(shard_ids, chunks):
+        for shard_id, chunk in zip(shard_ids, gpu.chunk(len(shard_ids), dim=1)):
             weight_loader(
                 param,
                 chunk,
@@ -355,8 +328,10 @@ class WeightUpdaterMixin:
                 shard_id=shard_id,
                 expert_id=0,
             )
-            for expert_id in range(param.shape[0]):
-                arrived.setdefault(expert_id, set()).add(shard_id)
+        # One tensor covers every expert, so every slice of the buffer is new.
+        arrived = self._pending_expert_relayout.setdefault((module, param_name), {})
+        for expert_id in range(param.shape[0]):
+            arrived.setdefault(expert_id, set()).update(shard_ids)
         return "updated"
 
     def _check_expert_sync_supported(
@@ -608,11 +583,6 @@ class WeightUpdaterMixin:
         from atom.model_ops.utils import shuffle_weights
 
         # The same decision the initial load makes, from the same function.
-        # Deciding it twice is how a synced weight ended up in a layout the
-        # loaded one would never have had: this side used to shuffle every
-        # per_1x32 and every per_Token fp8 weight, and to ignore the
-        # needs_preshuffled_weight exception that DeepSeek's fused qkv_a_proj
-        # sets.
         needs_shuffle = weight_is_stored_preshuffled(
             quant_type,
             getattr(module, "params_dtype", param.dtype),
