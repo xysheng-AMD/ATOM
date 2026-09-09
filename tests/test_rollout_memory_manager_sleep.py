@@ -1,16 +1,18 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""`Config.sleep_keeps_memory_resident`: who keeps their memory, and when.
+"""Sleep and wake: what a release frees, and what it invalidates.
 
 Sleep frees the weights and the KV pool and wake recaptures the decode graphs.
-That recapture faults under `expandable_segments`, so there is an option to
-keep both allocated and skip it -- and the whole point of the option is that
-nothing moves, which a test on `updated`/`released` counters cannot see. These
-assert on `data_ptr()` and on object identity.
+That recapture faults under `expandable_segments`, so there is an option --
+`Config.sleep_keeps_memory_resident` -- to keep both allocated and skip it.
+The whole point of the option is that nothing moves, which a test on
+`updated`/`released` counters cannot see, so these assert on `data_ptr()` and
+on object identity. It is off by default because keeping them costs exactly
+the memory a colocated trainer sleeps the rollout engine to reclaim.
 
-The option is off by default because keeping them costs exactly the memory a
-colocated trainer sleeps the rollout engine to reclaim.
+Either release invalidates the graphs, including the KV-only one that
+`sleep(level=1)` performs.
 """
 
 from types import SimpleNamespace
@@ -158,6 +160,42 @@ def test_default_wake_recaptures_the_graphs_it_released():
 
     assert runner.captures == 1
     assert not hasattr(runner, "_graphs_backup_keys")
+
+
+def test_releasing_only_the_kv_pool_still_invalidates_the_graphs():
+    """`AsyncLLMEngine.sleep(level=1)`, the default, frees the pool and nothing else.
+
+    The graphs captured the base of that pool, so they cannot be replayed
+    against the one `_resume_kv_cache` allocates in its place. Nothing else
+    would drop them either: the weights never moved, so the release path that
+    used to own the graphs is not the one that runs.
+    """
+    runner = _Runner(enforce_eager=False, keep_resident=False)
+
+    runner.release_memory(tags=["kv_cache"])
+
+    assert runner.graphs == {}
+    assert runner._graphs_backup_keys == [1, 2]
+
+    # The weights never left the device on a level-1 sleep.
+    _report_weights_on_device(runner)
+    runner.resume_memory(tags=["kv_cache"])
+
+    assert runner.allocated_blocks == [7]
+    assert runner.captures == 1
+    assert not hasattr(runner, "_graphs_backup_keys")
+
+
+def test_resident_sleep_keeps_the_graphs_on_a_kv_only_release():
+    runner = _Runner(enforce_eager=False, keep_resident=True)
+    pool = runner.kv_cache
+
+    runner.release_memory(tags=["kv_cache"])
+    runner.resume_memory(tags=["kv_cache"])
+
+    assert runner.kv_cache is pool
+    assert runner.graphs.keys() == {1, 2}
+    assert runner.captures == 0
 
 
 def test_resident_wake_has_nothing_to_recapture():
