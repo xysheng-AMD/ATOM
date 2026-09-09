@@ -7,10 +7,6 @@ Qwen3-8B carries 151936 embedding rows for 151665 real tokens. Those rows are
 neither zero nor -inf on that checkpoint -- they are copies of an existing
 embedding -- so the sampler reaches them and can return an id the tokenizer
 cannot decode, while the trainer masks exactly those positions on its side.
-
-The number used to arrive in `LUMENRL_ATOM_TRUE_VOCAB_SIZE`, an environment
-variable named after a downstream project. It is a Config field now, with the
-variable still read so a deployment mid-migration keeps its mask.
 """
 
 from dataclasses import fields
@@ -33,8 +29,6 @@ if not torch.cuda.is_available():
 from atom.model_engine.model_runner import ModelRunner
 from atom.rollout.model_runner_ext import RLHFModelRunner
 
-ENV = RLHFModelRunner.TRUE_VOCAB_SIZE_ENV
-
 
 def _config(**overrides):
     values = {"true_vocab_size": 0}
@@ -42,62 +36,21 @@ def _config(**overrides):
     return type("_Cfg", (), values)()
 
 
-# ── where the number comes from ───────────────────────────────────────────
+def _checked(true_vocab_size, vocab_size=151936):
+    runner = object.__new__(RLHFModelRunner)
+    runner._true_vocab_size = true_vocab_size
+    runner._check_true_vocab_size(_config(hf_config=_config(vocab_size=vocab_size)))
 
 
-def test_default_is_no_mask(monkeypatch):
-    monkeypatch.delenv(ENV, raising=False)
-    assert RLHFModelRunner._resolve_true_vocab_size(_config()) == 0
-
-
-def test_config_field_is_read(monkeypatch):
-    monkeypatch.delenv(ENV, raising=False)
-    assert (
-        RLHFModelRunner._resolve_true_vocab_size(_config(true_vocab_size=151665))
-        == 151665
-    )
-
-
-def test_legacy_env_var_still_works(monkeypatch):
-    monkeypatch.setenv(ENV, "151665")
-    assert RLHFModelRunner._resolve_true_vocab_size(_config()) == 151665
-
-
-def test_config_field_wins_over_the_env_var(monkeypatch, caplog):
-    """Both set and disagreeing is a migration half-done; say so and take the field."""
-    monkeypatch.setenv(ENV, "151936")
-    with caplog.at_level("WARNING"):
-        assert (
-            RLHFModelRunner._resolve_true_vocab_size(_config(true_vocab_size=151665))
-            == 151665
-        )
-    assert ENV in caplog.text
-
-
-def test_an_empty_env_var_is_not_a_value(monkeypatch):
-    monkeypatch.setenv(ENV, "")
-    assert RLHFModelRunner._resolve_true_vocab_size(_config(true_vocab_size=7)) == 7
-
-
-@pytest.mark.parametrize("bad", ["nonsense", "1.5", "-4"])
-def test_an_unparseable_env_var_raises(monkeypatch, bad):
-    monkeypatch.setenv(ENV, bad)
-    with pytest.raises(ValueError, match=ENV):
-        RLHFModelRunner._resolve_true_vocab_size(_config())
-
-
-def test_a_negative_config_field_raises(monkeypatch):
-    monkeypatch.delenv(ENV, raising=False)
-    with pytest.raises(ValueError, match="true_vocab_size"):
-        RLHFModelRunner._resolve_true_vocab_size(_config(true_vocab_size=-1))
+# ── what the number is allowed to be ──────────────────────────────────────
 
 
 def test_true_vocab_size_survives_the_engine_kwarg_filter():
     """`LLMEngine.__init__` keeps only kwargs naming a `Config` field.
 
-    That filter is what lets the downstream bridge pass `true_vocab_size` to
-    an ATOM build that does not know it. It also means a rename here turns the
-    mask off in silence rather than raising, so pin the name.
+    That filter is what lets a caller pass `true_vocab_size` to an ATOM build
+    that does not know it. It also means a rename here turns the mask off in
+    silence rather than raising, so pin the name.
     """
     engine_kwargs = {"true_vocab_size": 151665, "not_a_config_field": 1}
     config_fields = {f.name for f in fields(Config)}
@@ -112,16 +65,23 @@ def test_a_value_above_the_checkpoint_is_refused():
     One vocabulary's count against another's checkpoint masks nothing, which
     is the exact failure this path exists to prevent -- so it raises instead.
     """
-    runner = object.__new__(RLHFModelRunner)
-    runner._true_vocab_size = 200000
     with pytest.raises(ValueError, match="exceeds the checkpoint"):
-        runner._check_true_vocab_size(_config(hf_config=_config(vocab_size=151936)))
+        _checked(200000)
+
+
+def test_a_negative_value_is_refused():
+    """The other way a wrong number masks nothing instead of saying so."""
+    with pytest.raises(ValueError, match="expected >= 0"):
+        _checked(-1)
 
 
 def test_a_value_inside_the_checkpoint_is_accepted():
-    runner = object.__new__(RLHFModelRunner)
-    runner._true_vocab_size = 151665
-    runner._check_true_vocab_size(_config(hf_config=_config(vocab_size=151936)))
+    _checked(151665)
+
+
+def test_the_default_masks_nothing_and_checks_nothing():
+    """0 is every model whose embedding matrix matches its tokenizer."""
+    _checked(0, vocab_size=0)
 
 
 # ── what it does to the logits ────────────────────────────────────────────

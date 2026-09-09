@@ -12,6 +12,7 @@ import torch
 from aiter import init_dist_env
 from aiter.dist.parallel_state import get_tp_group
 from aiter.dist.utils import get_distributed_init_method
+from atom.config import Config
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.rollout.memory_manager import MemoryManagerMixin
@@ -33,79 +34,40 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
     to the base veRL behavior.
     """
 
-    # Superseded by `Config.true_vocab_size`, which is where the value belongs:
-    # it is a property of the checkpoint, not of the deployment, and upstream
-    # has no reason to carry a name prefixed with a downstream project's. Read
-    # as a fallback so a deployment that still exports it keeps its mask while
-    # it migrates; the field wins when both are set.
-    TRUE_VOCAB_SIZE_ENV = "LUMENRL_ATOM_TRUE_VOCAB_SIZE"
+    # Environment variable whose value is a comma-separated list of physical
+    # GPU indices assigned to this DP rank (e.g. "2,3").  When set, each DP
+    # rank's ModelRunners form an independent NCCL world with TP only.
+    # Frameworks may set this via their own env vars; the adapter layer is
+    # responsible for mapping to VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER before constructing the
+    # runner.
+    DP_DEVICE_MAP_ENV = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 
-    def __init__(self, rank: int, config):
-        self._true_vocab_size = self._resolve_true_vocab_size(config)
+    def __init__(self, rank: int, config: Config):
+        # 0 -- the default -- means "this checkpoint's vocabulary is not
+        # padded", which is the right answer for almost every model and costs
+        # one comparison per step.
+        self._true_vocab_size = config.true_vocab_size
         super().__init__(rank, config)
         self._check_true_vocab_size(config)
 
-    @classmethod
-    def _resolve_true_vocab_size(cls, config) -> int:
-        """`Config.true_vocab_size`, or the legacy environment variable.
-
-        0 means "this checkpoint's vocabulary is not padded", which is the
-        right answer for almost every model and costs one comparison per step.
-        """
-        configured = getattr(config, "true_vocab_size", 0) or 0
-        try:
-            configured = int(configured)
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"Invalid Config.true_vocab_size={configured!r}; expected an integer"
-            ) from None
-        if configured < 0:
-            raise ValueError(
-                f"Invalid Config.true_vocab_size={configured}; expected >= 0"
-            )
-
-        raw = os.environ.get(cls.TRUE_VOCAB_SIZE_ENV)
-        if raw is None or raw.strip() == "":
-            return configured
-        try:
-            from_env = int(raw)
-        except (TypeError, ValueError):
-            raise ValueError(
-                f"Invalid {cls.TRUE_VOCAB_SIZE_ENV}={raw!r}; expected an integer"
-            ) from None
-        if from_env < 0:
-            raise ValueError(
-                f"Invalid {cls.TRUE_VOCAB_SIZE_ENV}={from_env}; expected >= 0"
-            )
-
-        if configured:
-            if from_env != configured:
-                logger.warning(
-                    "Both Config.true_vocab_size=%d and %s=%d are set; using the "
-                    "config field. The environment variable is deprecated.",
-                    configured,
-                    cls.TRUE_VOCAB_SIZE_ENV,
-                    from_env,
-                )
-            return configured
-        logger.warning(
-            "%s is deprecated; pass true_vocab_size=%d to the engine instead.",
-            cls.TRUE_VOCAB_SIZE_ENV,
-            from_env,
-        )
-        return from_env
-
-    def _check_true_vocab_size(self, config) -> None:
+    def _check_true_vocab_size(self, config: Config) -> None:
         """Refuse a value that would mask nothing, rather than mask nothing.
 
-        The number counts the tokenizer's real tokens, so it cannot exceed the
-        rows the embedding matrix has. Getting it wrong the other way -- one
-        vocabulary's count against another's checkpoint -- silently disables
-        the mask, which is the failure this whole path exists to prevent.
+        The number counts the tokenizer's real tokens, so it can be neither
+        negative nor larger than the rows the embedding matrix has. Either way
+        round it silently disables the mask, which is the failure this whole
+        path exists to prevent.
         """
+        if self._true_vocab_size < 0:
+            raise ValueError(
+                f"Invalid true_vocab_size={self._true_vocab_size}; expected >= 0, "
+                f"where 0 means the vocabulary is not padded."
+            )
         if not self._true_vocab_size:
             return
-        padded = getattr(getattr(config, "hf_config", None), "vocab_size", 0) or 0
+        # Not every PretrainedConfig subclass carries vocab_size at the top
+        # level; when it is missing there is nothing to check against.
+        padded = getattr(config.hf_config, "vocab_size", 0)
         if padded and self._true_vocab_size > padded:
             raise ValueError(
                 f"true_vocab_size={self._true_vocab_size} exceeds the checkpoint's "
@@ -118,14 +80,6 @@ class RLHFModelRunner(ModelRunner, WeightUpdaterMixin, MemoryManagerMixin):
             self._true_vocab_size,
             padded,
         )
-
-    # Environment variable whose value is a comma-separated list of physical
-    # GPU indices assigned to this DP rank (e.g. "2,3").  When set, each DP
-    # rank's ModelRunners form an independent NCCL world with TP only.
-    # Frameworks may set this via their own env vars; the adapter layer is
-    # responsible for mapping to VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER before constructing the
-    # runner.
-    DP_DEVICE_MAP_ENV = "VLLM_DEVICE_CONTROL_ENV_VAR_PLACEHOLDER"
 
     def postprocess(
         self,
