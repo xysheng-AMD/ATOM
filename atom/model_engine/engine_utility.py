@@ -25,6 +25,13 @@ FIRE_AND_FORGET_UTILITY_CMDS = frozenset({"abort_request", "get_mtp_stats"})
 WEIGHT_UPDATE_UTILITY_CMDS = frozenset(
     {"update_weights", "update_weights_shm", "update_weights_ipc"}
 )
+# Freeze generation around a weight update and let it go on after, as vLLM's
+# pause_generation / resume_generation. "keep" preempts what is running, to be
+# recomputed on the new weights; a caller checks GENERATION_PAUSE_MODES to see
+# whether this ATOM can pause at all.
+PAUSE_GENERATION_CMD = "pause_generation"
+RESUME_GENERATION_CMD = "resume_generation"
+GENERATION_PAUSE_MODES = ("keep",)
 
 
 def completes_weight_sync(cmd: str, args: dict) -> bool:
@@ -106,6 +113,8 @@ class EngineUtilityHandler:
         "get_cache_statistics": "_handle_get_cache_statistics",
         "abort_request": "_handle_abort_request",
         COLLECTIVE_RPC_CMD: "_handle_collective_rpc",
+        PAUSE_GENERATION_CMD: "_handle_pause_generation",
+        RESUME_GENERATION_CMD: "_handle_resume_generation",
     }
 
     def __init__(
@@ -156,6 +165,10 @@ class EngineUtilityHandler:
                         self._begin_weight_sync(args.get("sync_id"))
                     self._weight_sync_in_progress = True
                 reply = self._execute_utility_command(cmd, args)
+                if cmd in (PAUSE_GENERATION_CMD, RESUME_GENERATION_CMD) and not (
+                    isinstance(reply, dict) and reply.get("error")
+                ):
+                    engine._generation_paused = cmd == PAUSE_GENERATION_CMD
                 # Track sleep/wake transitions
                 if cmd == "release_memory":
                     tags = args.get("tags", []) if isinstance(args, dict) else []
@@ -631,6 +644,53 @@ class EngineUtilityHandler:
             timeout=_remaining_timeout(args, 300.0),
         )
         logger.info(f"{self.label}: KV cache cleared")
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
+
+    def _handle_pause_generation(self, args: dict) -> dict:
+        """Stop scheduling, for a weight update while requests are in flight.
+
+        Utility commands run between engine steps, so an update sent after
+        this one lands on an engine that is not decoding. Its commit clears the
+        KV cache, so mode "keep" preempts every running sequence: once
+        ``resume_generation`` lets them go on, they recompute their context on
+        the new weights, keeping the tokens and logprobs they have. With
+        ``clear_cache`` (the default) the prefix-cache index goes too, or a
+        later request could reuse a block computed on the old weights.
+        """
+        args = args if isinstance(args, dict) else {}
+        try:
+            mode = args.get("mode", "keep")
+            if mode not in GENERATION_PAUSE_MODES:
+                raise ValueError(
+                    f"unsupported pause mode {mode!r}; supported: "
+                    f"{GENERATION_PAUSE_MODES}"
+                )
+            preempt_running = getattr(self.scheduler, "preempt_running", None)
+            if not callable(preempt_running):
+                raise TypeError(
+                    f"{type(self.scheduler).__name__} cannot preempt to pause"
+                )
+            preempted = preempt_running()
+            if args.get("clear_cache", True):
+                self.scheduler.block_manager.clear_cache()
+            reply = {"cmd": PAUSE_GENERATION_CMD, "preempted": preempted}
+            logger.info(
+                f"{self.label}: generation paused, {preempted} sequence(s) "
+                f"preempted"
+            )
+        except Exception as exc:  # noqa: BLE001 - a refused pause is answered
+            # Not raised: a refused pause leaves the engine serving, and the
+            # caller decides whether to update anyway.
+            reply = self._error_reply(PAUSE_GENERATION_CMD, exc)
+            logger.error(f"{self.label}: pause_generation failed: {reply['error']}")
+        self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
+        return reply
+
+    def _handle_resume_generation(self, args: dict) -> dict:
+        """Let scheduling go on after ``pause_generation``."""
+        reply = {"cmd": RESUME_GENERATION_CMD}
+        logger.info(f"{self.label}: generation resumed")
         self.output_queue.put_nowait(("UTILITY_RESPONSE", reply))
         return reply
 
