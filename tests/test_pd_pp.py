@@ -1533,6 +1533,9 @@ def _fake_head(batch):
     head._dispatch_connector_only_batch = (
         PPEngineCoreProc._dispatch_connector_only_batch.__get__(head)
     )
+    head._collect_pp_completions = PPEngineCoreProc._collect_pp_completions.__get__(
+        head
+    )
     PPEngineCoreProc._pp_head_step(head)
     return head
 
@@ -1720,6 +1723,9 @@ def _head_for_batch(batch, *, dynamic_chunking_active=False):
     head.scheduler.take_rejected.return_value = None
     head.scheduler.dynamic_chunking_active = dynamic_chunking_active
     head._dispatch_connector_only_batch = MagicMock()
+    head._collect_pp_completions = PPEngineCoreProc._collect_pp_completions.__get__(
+        head
+    )
     return PPEngineCoreProc, head
 
 
