@@ -86,7 +86,8 @@ class PPEngineCoreProc(EngineCore):
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
-                if self._is_idle_rl_weights_offloaded():
+                if self._is_engine_held():
+                    self._report_held_kv_work()
                     continue
                 if self._in_flight or not self.scheduler.is_finished():
                     self._pp_head_step()
@@ -103,6 +104,33 @@ class PPEngineCoreProc(EngineCore):
             except Exception:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
+
+    def prepare_weight_sync(self, deadline: float) -> None:
+        """The head retires the batches in the pipeline before a sync's first
+        update. A later stage fenced by the sync forwards nothing, so they
+        must be done before it hears of the sync, which CoreManager tells it
+        only once the head has answered."""
+        if self.is_head:
+            self._drain_pipeline(deadline)
+
+    def prepare_kv_change(self, *, weights: bool, deadline: float) -> None:
+        """A KV change also waits for an empty pipeline: a batch in flight
+        still writes KV into blocks the change would zero or free. The later
+        stages run the change only once the head has answered, so until then
+        they forward what it sent."""
+        if self.is_head:
+            self._drain_pipeline(deadline)
+        super().prepare_kv_change(weights=weights, deadline=deadline)
+
+    def _drain_pipeline(self, deadline: float) -> None:
+        """Retire the batches in the pipeline; raise if some are left at
+        *deadline*. Schedules none, so the pipeline only empties."""
+        while self._in_flight and time.monotonic() < deadline:
+            self._collect_pp_completions(_PP_IDLE_POLL_MS)
+        if self._in_flight:
+            raise RuntimeError(
+                f"{len(self._in_flight)} batch(es) still in the pipeline"
+            )
 
     def _pp_head_step(self):
         launched = 0
@@ -161,7 +189,11 @@ class PPEngineCoreProc(EngineCore):
         # that adopts a model calibrated from the prefills it launched.
         self._poll_dynamic_chunking_calibration()
 
-        poll_ms = 0 if launched else _PP_IDLE_POLL_MS
+        self._collect_pp_completions(0 if launched else _PP_IDLE_POLL_MS)
+
+    def _collect_pp_completions(self, poll_ms: int) -> None:
+        """Retire in-flight batches from the FIFO head as the last stage
+        completes them, waiting up to *poll_ms* for the first."""
         while self._in_flight:
             scheduled_batch, seqs, needs_output = self._in_flight[0]
             if not needs_output and not scheduled_batch.pp_completion_ack:
@@ -424,7 +456,7 @@ class PPEngineCoreProc(EngineCore):
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
-                if self._is_idle_rl_weights_offloaded():
+                if self._is_engine_held():
                     continue
                 batch = self.pp_transport.recv_metadata(timeout_ms=metadata_poll_ms)
                 if batch is None:
