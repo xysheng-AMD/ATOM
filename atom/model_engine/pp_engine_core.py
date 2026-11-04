@@ -105,6 +105,23 @@ class PPEngineCoreProc(EngineCore):
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
 
+    def pause_generation(self, deadline: float) -> None:
+        """On the head, schedule nothing more and retire what is in flight.
+
+        Only the head schedules, so a later stage has nothing to pause; it
+        keeps forwarding what the head already sent, which is what lets the
+        head's batches complete. Raises, unpaused, if they do not by
+        *deadline*.
+        """
+        if not self.is_head:
+            return
+        self._generation_paused = True
+        try:
+            self._drain_pipeline(deadline)
+        except RuntimeError:
+            self._generation_paused = False
+            raise
+
     def prepare_kv_change(self, *, weights: bool, deadline: float) -> None:
         """A KV change also waits for an empty pipeline: a batch in flight
         still writes KV into blocks the change would zero or free."""
