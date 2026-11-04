@@ -86,7 +86,8 @@ class PPEngineCoreProc(EngineCore):
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
-                if self._is_idle_rl_weights_offloaded():
+                if self._is_engine_held():
+                    self._report_held_kv_work()
                     continue
                 if self._in_flight or not self.scheduler.is_finished():
                     self._pp_head_step()
@@ -103,6 +104,15 @@ class PPEngineCoreProc(EngineCore):
             except Exception:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
+
+    def prepare_kv_change(self, *, weights: bool, deadline: float) -> None:
+        """A KV change also waits for an empty pipeline: a batch in flight
+        still writes KV into blocks the change would zero or free."""
+        if self.is_head and self._in_flight:
+            raise RuntimeError(
+                f"{len(self._in_flight)} batch(es) still in the pipeline"
+            )
+        super().prepare_kv_change(weights=weights, deadline=deadline)
 
     def _pp_head_step(self):
         launched = 0
@@ -424,7 +434,7 @@ class PPEngineCoreProc(EngineCore):
                 shutdown = shutdown or self.pull_and_process_input_queue()
                 if shutdown:
                     break
-                if self._is_idle_rl_weights_offloaded():
+                if self._is_engine_held():
                     continue
                 batch = self.pp_transport.recv_metadata(timeout_ms=metadata_poll_ms)
                 if batch is None:

@@ -2942,7 +2942,7 @@ def test_under_pp_each_stage_fences_a_save_after_the_forwards_it_reads(cluster):
             recv_metadata=lambda **_: queued.popleft() if queued else None
         ),
         pull_and_process_input_queue=lambda: not queued,  # stop once drained
-        _is_idle_rl_weights_offloaded=lambda: False,
+        _is_engine_held=lambda: False,
         _poll_and_send_kv_status=lambda: None,
     )
     PPEngineCoreProc._downstream_busy_loop(stage)

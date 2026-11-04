@@ -1630,7 +1630,7 @@ def test_pp_downstream_skips_forward_for_request_less_batch():
         scheduler=MagicMock(),
         utility_handler=MagicMock(),
         utility_queue=MagicMock(),
-        _is_idle_rl_weights_offloaded=lambda: False,
+        _is_engine_held=lambda: False,
         _poll_and_send_kv_status=MagicMock(),
     )
     # One pass over the loop body, then shut down.
@@ -1656,7 +1656,7 @@ def _downstream_stage(**overrides):
         scheduler=MagicMock(),
         utility_handler=MagicMock(),
         utility_queue=MagicMock(),
-        _is_idle_rl_weights_offloaded=lambda: False,
+        _is_engine_held=lambda: False,
         _poll_and_send_kv_status=MagicMock(),
     )
     for key, value in overrides.items():
