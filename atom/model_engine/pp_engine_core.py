@@ -105,12 +105,32 @@ class PPEngineCoreProc(EngineCore):
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
 
+    def pause_generation(self, deadline: float) -> None:
+        """On the head, schedule nothing more and retire what is in flight.
+
+        Only the head schedules, so a later stage has nothing to pause; it
+        keeps forwarding what the head already sent, which is what lets the
+        head's batches complete. Raises, unpaused, if they do not by
+        *deadline*.
+        """
+        if not self.is_head:
+            return
+        self._generation_paused = True
+        while self._in_flight and time.monotonic() < deadline:
+            self._collect_pp_completions(_PP_IDLE_POLL_MS)
+        if self._in_flight:
+            self._generation_paused = False
+            raise RuntimeError(
+                f"{len(self._in_flight)} batch(es) still in the pipeline"
+            )
+
     def prepare_kv_change(self, *, weights: bool, deadline: float) -> None:
         """A KV change also waits for an empty pipeline: a batch in flight
         still writes KV into blocks the change would zero or free."""
         if self.is_head and self._in_flight:
             raise RuntimeError(
-                f"{len(self._in_flight)} batch(es) still in the pipeline"
+                f"{len(self._in_flight)} batch(es) still in the pipeline; "
+                f"pause generation first"
             )
         super().prepare_kv_change(weights=weights, deadline=deadline)
 
@@ -171,7 +191,11 @@ class PPEngineCoreProc(EngineCore):
         # that adopts a model calibrated from the prefills it launched.
         self._poll_dynamic_chunking_calibration()
 
-        poll_ms = 0 if launched else _PP_IDLE_POLL_MS
+        self._collect_pp_completions(0 if launched else _PP_IDLE_POLL_MS)
+
+    def _collect_pp_completions(self, poll_ms: int) -> None:
+        """Retire in-flight batches from the FIFO head as the last stage
+        completes them, waiting up to *poll_ms* for the first."""
         while self._in_flight:
             scheduled_batch, seqs, needs_output = self._in_flight[0]
             if not needs_output and not scheduled_batch.pp_completion_ack:
